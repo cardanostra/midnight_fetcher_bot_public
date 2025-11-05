@@ -50,6 +50,12 @@ This software includes a small development fee to support ongoing maintenance an
 
 ## Usage
 
+Run: setup.cmd
+
+On Complete navigate on browser to
+
+http://localhost:9001
+
 ### First Time Setup
 
 1. **Create Wallet**
