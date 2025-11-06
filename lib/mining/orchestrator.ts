@@ -348,6 +348,9 @@ class MiningOrchestrator extends EventEmitter {
         this.currentChallengeId = challengeId;
         this.currentChallenge = challenge.challenge;
 
+        // Load challenge state from receipts (restore progress, solutions count, etc.)
+        this.loadChallengeState(challengeId);
+
         // Emit status
         this.emit('status', {
           type: 'status',
@@ -1021,6 +1024,9 @@ class MiningOrchestrator extends EventEmitter {
         success: false,
         message: detailedMessage,
       } as MiningEvent);
+
+      // Re-throw the error so the caller knows submission failed
+      throw error;
     }
   }
 
@@ -1082,6 +1088,55 @@ class MiningOrchestrator extends EventEmitter {
       console.log(`[Orchestrator] Loaded ${this.solvedAddressChallenges.size} addresses with solved challenges`);
     } catch (error: any) {
       console.error('[Orchestrator] Failed to load submitted solutions:', error.message);
+    }
+  }
+
+  /**
+   * Load challenge-specific state from receipts
+   * Call this when a challenge is loaded to restore progress for that challenge
+   */
+  private loadChallengeState(challengeId: string): void {
+    try {
+      const allReceipts = receiptsLogger.readReceipts();
+
+      // Filter receipts for this specific challenge
+      const challengeReceipts = allReceipts.filter(r => r.challenge_id === challengeId);
+      const userReceipts = challengeReceipts.filter(r => !r.isDevFee);
+      const devFeeReceipts = challengeReceipts.filter(r => r.isDevFee);
+
+      console.log(`[Orchestrator] ═══════════════════════════════════════════════`);
+      console.log(`[Orchestrator] LOADING CHALLENGE STATE`);
+      console.log(`[Orchestrator] Challenge ID: ${challengeId.slice(0, 16)}...`);
+      console.log(`[Orchestrator] Found ${challengeReceipts.length} receipts for this challenge`);
+      console.log(`[Orchestrator]   - User solutions: ${userReceipts.length}`);
+      console.log(`[Orchestrator]   - Dev fee solutions: ${devFeeReceipts.length}`);
+
+      // Restore solutionsFound count for this challenge
+      this.solutionsFound = challengeReceipts.length;
+
+      // Clear and restore addressesProcessedCurrentChallenge with address indexes
+      this.addressesProcessedCurrentChallenge.clear();
+
+      for (const receipt of userReceipts) {
+        // Find the address index for this receipt
+        const addressIndex = this.addresses.findIndex(a => a.bech32 === receipt.address);
+        if (addressIndex !== -1) {
+          this.addressesProcessedCurrentChallenge.add(addressIndex);
+        }
+      }
+
+      console.log(`[Orchestrator] Progress: ${this.addressesProcessedCurrentChallenge.size}/${this.addresses.length} user addresses solved for this challenge`);
+      console.log(`[Orchestrator] Total solutions: ${this.solutionsFound} (${userReceipts.length} user + ${devFeeReceipts.length} dev fee)`);
+      console.log(`[Orchestrator] ═══════════════════════════════════════════════`);
+
+      // Emit stats update to refresh UI with restored state
+      this.emit('stats', {
+        type: 'stats',
+        stats: this.getStats(),
+      } as MiningEvent);
+
+    } catch (error: any) {
+      console.error('[Orchestrator] Failed to load challenge state:', error.message);
     }
   }
 
