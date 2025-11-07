@@ -98,6 +98,35 @@ class ReceiptsLogger {
   }
 
   /**
+   * Get the last N receipts
+   */
+  getRecentReceipts(count: number): Receipt[] {
+    try {
+      if (!fs.existsSync(this.receiptsFile)) {
+        return [];
+      }
+
+      const content = fs.readFileSync(this.receiptsFile, 'utf8');
+      const lines = content.trim().split('\n').filter(line => line.length > 0);
+
+      // Get last N lines
+      const recentLines = lines.slice(-count);
+
+      return recentLines.map(line => {
+        try {
+          return JSON.parse(line);
+        } catch (e) {
+          console.error('[ReceiptsLogger] Failed to parse receipt line:', line);
+          return null;
+        }
+      }).filter(receipt => receipt !== null) as Receipt[];
+    } catch (error: any) {
+      console.error('[ReceiptsLogger] Failed to read recent receipts:', error.message);
+      return [];
+    }
+  }
+
+  /**
    * Read all errors
    */
   readErrors(): ErrorLog[] {

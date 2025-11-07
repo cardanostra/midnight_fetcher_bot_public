@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import * as os from 'os';
+import { miningOrchestrator } from '@/lib/mining/orchestrator';
 
 /**
  * System Specs API - Returns hardware specifications for scaling recommendations
@@ -24,12 +25,17 @@ export async function GET() {
     const usedMemoryGB = ((totalMemory - freeMemory) / (1024 ** 3)).toFixed(2);
     const memoryUsagePercent = (((totalMemory - freeMemory) / totalMemory) * 100).toFixed(1);
 
+    // Get current configuration from orchestrator
+    const currentConfig = miningOrchestrator.getCurrentConfiguration();
+
     // Calculate recommendations
     const recommendations = calculateRecommendations({
       cpuCount,
       cpuSpeed,
       totalMemoryGB: parseFloat(totalMemoryGB),
       platform,
+      currentWorkerThreads: currentConfig.workerThreads,
+      currentBatchSize: currentConfig.batchSize,
     });
 
     return NextResponse.json({
@@ -75,8 +81,10 @@ function calculateRecommendations(specs: {
   cpuSpeed: number;
   totalMemoryGB: number;
   platform: string;
+  currentWorkerThreads: number;
+  currentBatchSize: number;
 }) {
-  const { cpuCount, cpuSpeed, totalMemoryGB, platform } = specs;
+  const { cpuCount, cpuSpeed, totalMemoryGB, currentWorkerThreads, currentBatchSize } = specs;
 
   // Worker threads recommendation
   // Rule: Use 80% of CPU cores to leave headroom for OS and other processes
@@ -163,14 +171,14 @@ function calculateRecommendations(specs: {
   return {
     systemTier,
     workerThreads: {
-      current: 12, // Read from orchestrator
+      current: currentWorkerThreads,
       optimal: optimalWorkers,
       conservative: finalConservativeWorkers,
       max: maxWorkers,
       explanation: `Based on ${cpuCount} CPU cores. Optimal uses ~${Math.round((optimalWorkers / cpuCount) * 100)}% of cores, leaving headroom for OS tasks.`,
     },
     batchSize: {
-      current: 350, // Read from orchestrator
+      current: currentBatchSize,
       optimal: optimalBatchSize,
       conservative: conservativeBatchSize,
       max: maxBatchSize,

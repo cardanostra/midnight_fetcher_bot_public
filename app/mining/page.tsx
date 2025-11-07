@@ -133,6 +133,10 @@ function MiningDashboardContent() {
   const [scaleRecommendations, setScaleRecommendations] = useState<any>(null);
   const [scaleLoading, setScaleLoading] = useState(false);
   const [scaleError, setScaleError] = useState<string | null>(null);
+  const [editedWorkerThreads, setEditedWorkerThreads] = useState<number | null>(null);
+  const [editedBatchSize, setEditedBatchSize] = useState<number | null>(null);
+  const [applyingChanges, setApplyingChanges] = useState(false);
+  const [showApplyConfirmation, setShowApplyConfirmation] = useState(false);
 
   // Addresses state
   const [addressesData, setAddressesData] = useState<any | null>(null);
@@ -413,6 +417,9 @@ function MiningDashboardContent() {
       if (data.success) {
         setScaleSpecs(data.specs);
         setScaleRecommendations(data.recommendations);
+        // Initialize edited values with current values
+        setEditedWorkerThreads(data.recommendations.workerThreads.current);
+        setEditedBatchSize(data.recommendations.batchSize.current);
       } else {
         setScaleError(data.error || 'Failed to load system specifications');
       }
@@ -421,6 +428,53 @@ function MiningDashboardContent() {
     } finally {
       setScaleLoading(false);
     }
+  };
+
+  const applyPerformanceChanges = async () => {
+    if (!editedWorkerThreads || !editedBatchSize) {
+      return;
+    }
+
+    setApplyingChanges(true);
+    try {
+      const response = await fetch('/api/mining/update-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workerThreads: editedWorkerThreads,
+          batchSize: editedBatchSize,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        // Close confirmation dialog
+        setShowApplyConfirmation(false);
+
+        // Restart mining with new configuration
+        await handleStopMining();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await handleStartMining();
+
+        // Refresh scale data to show updated values
+        await fetchScaleData();
+      } else {
+        setScaleError(data.error || 'Failed to apply changes');
+      }
+    } catch (err: any) {
+      setScaleError(err.message || 'Failed to apply changes');
+    } finally {
+      setApplyingChanges(false);
+    }
+  };
+
+  const hasChanges = () => {
+    if (!scaleRecommendations) return false;
+    return (
+      editedWorkerThreads !== scaleRecommendations.workerThreads.current ||
+      editedBatchSize !== scaleRecommendations.batchSize.current
+    );
   };
 
   const copyToClipboard = async (text: string, id: string) => {
@@ -2095,14 +2149,20 @@ function MiningDashboardContent() {
                     </CardHeader>
                     <CardContent className="space-y-4">
                       <div className="space-y-3">
-                        <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-                          <span className="text-gray-400">Current:</span>
-                          <span className="text-2xl font-bold text-white">
-                            {scaleRecommendations.workerThreads.current}
-                          </span>
+                        <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg border-2 border-yellow-500/50">
+                          <span className="text-gray-400 font-semibold">Edit Value:</span>
+                          <input
+                            type="number"
+                            min="1"
+                            max={scaleRecommendations.workerThreads.max}
+                            value={editedWorkerThreads || ''}
+                            onChange={(e) => setEditedWorkerThreads(parseInt(e.target.value) || 1)}
+                            className="w-24 px-3 py-2 text-2xl font-bold text-center bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-yellow-500 text-white"
+                          />
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg cursor-pointer hover:bg-green-900/30 transition-colors"
+                          onClick={() => setEditedWorkerThreads(scaleRecommendations.workerThreads.optimal)}>
                           <div className="flex items-center gap-2">
                             <CheckCircle2 className="w-5 h-5 text-green-400" />
                             <span className="text-green-400 font-semibold">Optimal:</span>
@@ -2112,14 +2172,16 @@ function MiningDashboardContent() {
                           </span>
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-700/50 rounded-lg cursor-pointer hover:bg-blue-900/30 transition-colors"
+                          onClick={() => setEditedWorkerThreads(scaleRecommendations.workerThreads.conservative)}>
                           <span className="text-blue-400">Conservative:</span>
                           <span className="text-xl font-bold text-blue-400">
                             {scaleRecommendations.workerThreads.conservative}
                           </span>
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-orange-900/20 border border-orange-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-orange-900/20 border border-orange-700/50 rounded-lg cursor-pointer hover:bg-orange-900/30 transition-colors"
+                          onClick={() => setEditedWorkerThreads(scaleRecommendations.workerThreads.max)}>
                           <span className="text-orange-400">Maximum:</span>
                           <span className="text-xl font-bold text-orange-400">
                             {scaleRecommendations.workerThreads.max}
@@ -2152,14 +2214,21 @@ function MiningDashboardContent() {
                     </CardHeader>
                     <CardContent className="space-y-4">
                       <div className="space-y-3">
-                        <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-                          <span className="text-gray-400">Current:</span>
-                          <span className="text-2xl font-bold text-white">
-                            {scaleRecommendations.batchSize.current}
-                          </span>
+                        <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg border-2 border-yellow-500/50">
+                          <span className="text-gray-400 font-semibold">Edit Value:</span>
+                          <input
+                            type="number"
+                            min="50"
+                            max={scaleRecommendations.batchSize.max}
+                            step="50"
+                            value={editedBatchSize || ''}
+                            onChange={(e) => setEditedBatchSize(parseInt(e.target.value) || 50)}
+                            className="w-24 px-3 py-2 text-2xl font-bold text-center bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:border-yellow-500 text-white"
+                          />
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-green-900/20 border border-green-700/50 rounded-lg cursor-pointer hover:bg-green-900/30 transition-colors"
+                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.optimal)}>
                           <div className="flex items-center gap-2">
                             <CheckCircle2 className="w-5 h-5 text-green-400" />
                             <span className="text-green-400 font-semibold">Optimal:</span>
@@ -2169,14 +2238,16 @@ function MiningDashboardContent() {
                           </span>
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-700/50 rounded-lg cursor-pointer hover:bg-blue-900/30 transition-colors"
+                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.conservative)}>
                           <span className="text-blue-400">Conservative:</span>
                           <span className="text-xl font-bold text-blue-400">
                             {scaleRecommendations.batchSize.conservative}
                           </span>
                         </div>
 
-                        <div className="flex items-center justify-between p-3 bg-orange-900/20 border border-orange-700/50 rounded-lg">
+                        <div className="flex items-center justify-between p-3 bg-orange-900/20 border border-orange-700/50 rounded-lg cursor-pointer hover:bg-orange-900/30 transition-colors"
+                          onClick={() => setEditedBatchSize(scaleRecommendations.batchSize.max)}>
                           <span className="text-orange-400">Maximum:</span>
                           <span className="text-xl font-bold text-orange-400">
                             {scaleRecommendations.batchSize.max}
@@ -2196,6 +2267,103 @@ function MiningDashboardContent() {
                     </CardContent>
                   </Card>
                 </div>
+
+                {/* Apply Changes Button */}
+                {hasChanges() && (
+                  <div className="flex justify-center">
+                    <Button
+                      onClick={() => setShowApplyConfirmation(true)}
+                      variant="primary"
+                      className="px-8 py-4 text-lg"
+                      disabled={applyingChanges}
+                    >
+                      {applyingChanges ? (
+                        <>
+                          <RefreshCw className="w-5 h-5 animate-spin" />
+                          Applying Changes...
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle2 className="w-5 h-5" />
+                          Apply Changes & Restart Mining
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )}
+
+                {/* Confirmation Dialog */}
+                {showApplyConfirmation && (
+                  <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <Card variant="elevated" className="max-w-lg w-full">
+                      <CardHeader>
+                        <CardTitle className="flex items-center gap-2 text-xl">
+                          <AlertCircle className="w-6 h-6 text-yellow-400" />
+                          Confirm Performance Changes
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="space-y-4">
+                        <p className="text-gray-300">
+                          You are about to apply the following performance configuration changes:
+                        </p>
+
+                        <div className="space-y-2 bg-gray-800/50 p-4 rounded-lg border border-gray-700">
+                          <div className="flex items-center justify-between">
+                            <span className="text-gray-400">Worker Threads:</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-white font-mono">{scaleRecommendations.workerThreads.current}</span>
+                              <span className="text-gray-500">→</span>
+                              <span className="text-green-400 font-mono font-bold">{editedWorkerThreads}</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-gray-400">Batch Size:</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-white font-mono">{scaleRecommendations.batchSize.current}</span>
+                              <span className="text-gray-500">→</span>
+                              <span className="text-green-400 font-mono font-bold">{editedBatchSize}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <Alert variant="warning">
+                          <AlertCircle className="w-4 h-4" />
+                          <span className="text-sm">
+                            Mining will be stopped and restarted automatically with the new configuration.
+                            This may take a few seconds.
+                          </span>
+                        </Alert>
+
+                        <div className="flex gap-3 justify-end">
+                          <Button
+                            onClick={() => setShowApplyConfirmation(false)}
+                            variant="outline"
+                            disabled={applyingChanges}
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            onClick={applyPerformanceChanges}
+                            variant="primary"
+                            disabled={applyingChanges}
+                          >
+                            {applyingChanges ? (
+                              <>
+                                <RefreshCw className="w-4 h-4 animate-spin" />
+                                Applying...
+                              </>
+                            ) : (
+                              <>
+                                <CheckCircle2 className="w-4 h-4" />
+                                Apply & Restart
+                              </>
+                            )}
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </div>
+                )}
 
                 {/* Performance Notes */}
                 <Card variant="glass">

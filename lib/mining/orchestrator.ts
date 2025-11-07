@@ -27,7 +27,6 @@ class MiningOrchestrator extends EventEmitter {
   private pollInterval = 2000; // 2 seconds - frequent polling to keep latest_submission fresh (it updates with every network solution)
   private pollTimer: NodeJS.Timeout | null = null;
   private walletManager: WalletManager | null = null;
-  private needsDevFeeCatchup = false; // Flag to trigger dev fee check after ROM is ready (startup only)
   private isDevFeeMining = false; // Flag to prevent multiple simultaneous dev fee mining operations
   private addresses: DerivedAddress[] = [];
   private solutionsFound = 0;
@@ -51,6 +50,38 @@ class MiningOrchestrator extends EventEmitter {
   private stoppedWorkers = new Set<number>(); // Track workers that should stop immediately
   private currentMiningAddress: string | null = null; // Track which address we're currently mining
   private addressSubmissionFailures = new Map<string, number>(); // Track submission failures per address (address+challenge key)
+  private customBatchSize: number | null = null; // Custom batch size override
+
+  /**
+   * Update orchestrator configuration dynamically
+   */
+  updateConfiguration(config: { workerThreads?: number; batchSize?: number }): void {
+    if (config.workerThreads !== undefined) {
+      console.log(`[Orchestrator] Updating workerThreads: ${this.workerThreads} -> ${config.workerThreads}`);
+      this.workerThreads = config.workerThreads;
+    }
+    if (config.batchSize !== undefined) {
+      console.log(`[Orchestrator] Updating batchSize: ${this.customBatchSize || 'default'} -> ${config.batchSize}`);
+      this.customBatchSize = config.batchSize;
+    }
+  }
+
+  /**
+   * Get current configuration
+   */
+  getCurrentConfiguration(): { workerThreads: number; batchSize: number } {
+    return {
+      workerThreads: this.workerThreads,
+      batchSize: this.getBatchSize(),
+    };
+  }
+
+  /**
+   * Get current batch size (custom or default)
+   */
+  private getBatchSize(): number {
+    return this.customBatchSize || 300; // Default BATCH_SIZE
+  }
 
   /**
    * Start mining with loaded wallet
@@ -89,31 +120,7 @@ class MiningOrchestrator extends EventEmitter {
       }
     }
 
-    // Check if we need a dev fee at startup (1 in 17 ratio check)
-    // IMPORTANT: We don't mine it here because ROM isn't ready yet
-    // Instead, we set a flag to trigger after first poll when ROM is initialized
-    if (devFeeReady && devFeeManager.isEnabled()) {
-      const ratio = devFeeManager.getRatio();
-      const userSolutionsSinceLastDevFee = this.userSolutionsCount % ratio;
-
-      console.log(`[Orchestrator] Dev fee check at startup:`);
-      console.log(`[Orchestrator]    Total user solutions: ${this.userSolutionsCount}`);
-      console.log(`[Orchestrator]    Ratio: 1 in ${ratio}`);
-      console.log(`[Orchestrator]    Solutions since last dev fee: ${userSolutionsSinceLastDevFee}`);
-
-      // Check if we need a dev fee: are we at a multiple of 17?
-      if (userSolutionsSinceLastDevFee === 0 && this.userSolutionsCount > 0) {
-        console.log(`[Orchestrator] 🎯 Dev fee needed on startup (at ${ratio} solution threshold)`);
-        console.log(`[Orchestrator]    Will mine 1 dev fee after ROM initialization`);
-
-        // Set flag to trigger dev fee mining AFTER ROM is ready
-        this.needsDevFeeCatchup = true;
-      } else if (this.userSolutionsCount === 0) {
-        console.log(`[Orchestrator] ✓ No solutions yet, no dev fee needed`);
-      } else {
-        console.log(`[Orchestrator] ✓ No dev fee needed (${userSolutionsSinceLastDevFee}/${ratio} solutions since last dev fee)`);
-      }
-    }
+    // Dev fee will be checked after each solution submission (not on startup)
 
     this.isRunning = true;
     this.startTime = Date.now();
@@ -415,23 +422,6 @@ class MiningOrchestrator extends EventEmitter {
           challengeId,
         } as MiningEvent);
 
-        // CRITICAL: Check if we need to mine a dev fee BEFORE starting regular mining
-        // This only runs once on the first challenge after startup if dev fee is behind
-        if (this.needsDevFeeCatchup) {
-          console.log('[Orchestrator] ⏳ ROM is ready, checking dev fee status BEFORE starting regular mining...');
-          this.needsDevFeeCatchup = false; // Clear flag so it only runs once
-          try {
-            // Temporarily enable mining for dev fee (required by mineForAddress loop)
-            this.isMining = true;
-            await this.checkAndMineDevFee();
-            this.isMining = false; // Reset after dev fee mining
-            console.log('[Orchestrator] ✓ Dev fee check completed, starting regular mining...');
-          } catch (err: any) {
-            this.isMining = false; // Make sure to reset even on error
-            console.error('[Orchestrator] Dev fee check failed:', err.message);
-          }
-        }
-
         // Start mining for this challenge
         if (!this.isMining) {
           this.startMining();
@@ -555,10 +545,18 @@ class MiningOrchestrator extends EventEmitter {
       // Clear stopped workers set for this address
       this.stoppedWorkers.clear();
 
-      // Launch all 10 workers to mine for the SAME address in parallel
-      // Workers will keep mining until address is solved or max failures reached
-      // Each worker gets a unique ID (0-9) to generate different nonces
-      const workers = Array(this.workerThreads).fill(null).map((_, workerId) =>
+      // Launch workers to mine for the SAME address in parallel
+      // ALWAYS reserve 20% of workers for potential dev fee mining
+      // This prevents worker ID conflicts when dev fee starts/stops
+      // Workers 0-7 (80%) = user mining, Workers 8-10 (20%) = dev fee mining
+      const userWorkerCount = Math.floor(this.workerThreads * 0.8);
+
+      if (this.isDevFeeMining) {
+        console.log(`[Orchestrator] Dev fee active - using ${userWorkerCount} workers for user mining (${this.workerThreads - userWorkerCount} reserved for dev fee)`);
+      }
+
+      // Each worker gets a unique ID (0 to userWorkerCount-1) to generate different nonces
+      const workers = Array(userWorkerCount).fill(null).map((_, workerId) =>
         this.mineForAddress(addr, false, workerId, MAX_SUBMISSION_FAILURES)
       );
 
@@ -578,9 +576,6 @@ class MiningOrchestrator extends EventEmitter {
       // After solution submitted or max failures, the 2-second poll will refresh challenge data
       // Next address will use fresh latest_submission value
     }
-
-    // After mining all user addresses, check if we need to mine a dev fee solution
-    await this.checkAndMineDevFee();
 
     this.isMining = false;
   }
@@ -646,7 +641,7 @@ class MiningOrchestrator extends EventEmitter {
       challengeId,
     } as MiningEvent);
 
-    const BATCH_SIZE = 300; // Reduced batch size to prevent hash service 408 timeouts
+    const BATCH_SIZE = this.getBatchSize(); // Use dynamic batch size (custom or default 300)
     const PROGRESS_INTERVAL = 1; // Emit progress every batch for updates
     let hashCount = 0;
     let batchCounter = 0;
@@ -794,11 +789,26 @@ class MiningOrchestrator extends EventEmitter {
             // Mark as submitting to prevent other workers from submitting
             this.submittingAddresses.add(submissionKey);
 
-            // IMMEDIATELY stop all other workers to save CPU
-            console.log(`[Orchestrator] Worker ${workerId}: Solution found! Stopping all other workers immediately`);
-            for (let i = 0; i < this.workerThreads; i++) {
-              if (i !== workerId) {
-                this.stoppedWorkers.add(i);
+            // IMMEDIATELY stop all other workers MINING THE SAME ADDRESS to save CPU
+            // Dev fee workers: only stop other dev fee workers (not user workers)
+            // User workers: only stop other user workers (not dev fee workers)
+            const userWorkerCount = Math.floor(this.workerThreads * 0.8);
+
+            if (isDevFee) {
+              // Stop other dev fee workers (IDs >= userWorkerCount)
+              console.log(`[Orchestrator] Worker ${workerId}: Dev fee solution found! Stopping other dev fee workers`);
+              for (let i = userWorkerCount; i < this.workerThreads; i++) {
+                if (i !== workerId) {
+                  this.stoppedWorkers.add(i);
+                }
+              }
+            } else {
+              // Stop other user workers (IDs < userWorkerCount)
+              console.log(`[Orchestrator] Worker ${workerId}: User solution found! Stopping other user workers`);
+              for (let i = 0; i < userWorkerCount; i++) {
+                if (i !== workerId) {
+                  this.stoppedWorkers.add(i);
+                }
               }
             }
 
@@ -1059,8 +1069,8 @@ class MiningOrchestrator extends EventEmitter {
           } as MiningEvent);
         }
 
-        // Only log every 10th progress update to console
-        if (batchCounter % (PROGRESS_INTERVAL * 10) === 0) {
+        // Only log every 100th progress update to console (reduced logging frequency)
+        if (batchCounter % (PROGRESS_INTERVAL * 100) === 0) {
           const progressMsg = `Worker ${workerId} for Address ${addr.index}: ${hashCount.toLocaleString()} hashes @ ${hashRate.toLocaleString()} H/s (Challenge: ${challengeId.slice(0, 8)}...)`;
           console.log(`[Orchestrator] ${progressMsg}`);
         }
@@ -1138,31 +1148,19 @@ class MiningOrchestrator extends EventEmitter {
         this.userSolutionsCount++;
         console.log(`[Orchestrator] User solution submitted. User solutions count: ${this.userSolutionsCount}`);
 
-        // Check for dev fee after every user solution (1 in 17 ratio check)
+        // Simple dev fee check: Look at last 17 receipts, if no dev fee found, mine one NOW (don't wait)
         const ratio = devFeeManager.getRatio();
-        const userSolutionsSinceLastDevFee = this.userSolutionsCount % ratio;
+        const lastReceipts = receiptsLogger.getRecentReceipts(ratio);
+        const hasDevFeeInLastN = lastReceipts.some(r => r.isDevFee);
 
-        console.log(`[Orchestrator] Dev fee check: userSolutions=${this.userSolutionsCount}, ratio=1 in ${ratio}, solutionsSinceLastDevFee=${userSolutionsSinceLastDevFee}`);
+        console.log(`[Orchestrator] Dev fee check: Checked last ${lastReceipts.length} receipts, found dev fee: ${hasDevFeeInLastN}`);
 
-        // If we've reached the threshold (multiple of ratio), mine 1 dev fee
-        if (userSolutionsSinceLastDevFee === 0) {
-          console.log(`[Orchestrator] 🎯 Dev fee threshold reached! Triggering dev fee mining in background...`);
-          // Only start dev fee mining if not already running
-          if (!this.isDevFeeMining) {
-            this.isDevFeeMining = true;
-            this.checkAndMineDevFee()
-              .then(() => {
-                this.isDevFeeMining = false;
-              })
-              .catch(err => {
-                console.error('[Orchestrator] Dev fee mining failed:', err.message);
-                this.isDevFeeMining = false;
-              });
-          } else {
-            console.log(`[Orchestrator] ⏳ Dev fee already mining in background, skipping...`);
-          }
+        if (!hasDevFeeInLastN && lastReceipts.length >= ratio) {
+          console.log(`[Orchestrator] 🎯 No dev fee in last ${ratio} receipts! Starting dev fee mining in background NOW...`);
+          // Start dev fee mining immediately in background (don't block)
+          this.startDevFeeMining();
         } else {
-          console.log(`[Orchestrator] ✓ No dev fee needed yet (${userSolutionsSinceLastDevFee}/${ratio} since last dev fee)`);
+          console.log(`[Orchestrator] ✓ Dev fee found in last ${ratio} receipts or not enough receipts yet`);
         }
       }
 
@@ -1385,148 +1383,121 @@ class MiningOrchestrator extends EventEmitter {
   }
 
   /**
-   * Check if dev fee solution should be mined and mine it
-   */
-  private async checkAndMineDevFee(): Promise<void> {
-    console.log('[Orchestrator] ========== DEV FEE CHECK START ==========');
-
-    if (!devFeeManager.isEnabled()) {
-      console.log('[Orchestrator] Dev fee is disabled, skipping');
-      return;
-    }
-
-    // Check if we have valid address pool (10 addresses)
-    if (!devFeeManager.hasValidAddressPool()) {
-      console.log('[Orchestrator] ✗ Dev fee DISABLED - no valid address pool (need 10 addresses)');
-      return;
-    }
-
-    if (!this.currentChallengeId) {
-      console.log('[Orchestrator] No active challenge, skipping dev fee check');
-      return;
-    }
-
-    console.log('[Orchestrator] Dev fee is enabled, checking if payment needed...');
-
-    const ratio = devFeeManager.getRatio();
-    const totalDevFeeSolutions = devFeeManager.getTotalDevFeeSolutions();
-
-    console.log(`[Orchestrator] Dev fee stats (from receipts - single source of truth):`);
-    console.log(`[Orchestrator]   - User solutions: ${this.userSolutionsCount} (from receipts)`);
-    console.log(`[Orchestrator]   - Dev fee solutions paid: ${totalDevFeeSolutions} (from receipts)`);
-    console.log(`[Orchestrator]   - Dev fee ratio: 1/${ratio} (${(100/ratio).toFixed(2)}%)`);
-    console.log(`[Orchestrator]   - Current challenge: ${this.currentChallengeId}`);
-
-    // Calculate how many dev fee solutions we should have by now
-    const expectedDevFees = Math.floor(this.userSolutionsCount / ratio);
-    console.log(`[Orchestrator]   - Expected dev fees by now: ${expectedDevFees} (${this.userSolutionsCount} / ${ratio})`);
-
-    // Mine dev fee solutions if we're behind
-    const devFeesNeeded = expectedDevFees - totalDevFeeSolutions;
-    console.log(`[Orchestrator]   - Dev fees needed: ${devFeesNeeded} (${expectedDevFees} expected - ${totalDevFeeSolutions} paid)`);
-
-    if (devFeesNeeded > 0) {
-      // IMPORTANT: Only mine ONE dev fee at a time (1 in 17 ratio)
-      // After each user solution is submitted, we check the ratio again
-      console.log(`[Orchestrator] ✓ Dev fee payment needed! Mining 1 dev fee solution...`);
-      console.log(`[Orchestrator]    (Currently behind by ${devFeesNeeded}, will check ratio after each solution)`);
-
-      // Process ONE dev fee solution
-      for (let i = 0; i < 1; i++) {
-        try {
-          // Fetch dev fee address and check if it has already solved this challenge
-          console.log(`[Orchestrator] [DEV FEE] Fetching dev fee address...`);
-          let devFeeAddress: string;
-
-          try {
-            devFeeAddress = await devFeeManager.getDevFeeAddress();
-          } catch (error: any) {
-            console.error(`[Orchestrator] [DEV FEE] ✗ Failed to get dev fee address from API: ${error.message}`);
-            console.log(`[Orchestrator] [DEV FEE] Skipping dev fee solution - no valid address available`);
-            continue;
-          }
-
-          // Validate address format
-          if (!devFeeAddress || (!devFeeAddress.startsWith('addr1') && !devFeeAddress.startsWith('tnight1'))) {
-            console.error(`[Orchestrator] [DEV FEE] ✗ Invalid address format: ${devFeeAddress}`);
-            console.log(`[Orchestrator] [DEV FEE] Skipping dev fee solution - invalid address`);
-            continue;
-          }
-
-          // Check if this address has already solved the current challenge
-          const solvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
-          if (solvedChallenges && solvedChallenges.has(this.currentChallengeId)) {
-            console.log(`[Orchestrator] [DEV FEE] ⚠ Address ${devFeeAddress} already solved challenge ${this.currentChallengeId.slice(0, 8)}...`);
-            console.log(`[Orchestrator] [DEV FEE] Fetching new dev fee address from API...`);
-
-            // Force fetch a new address from the API (not cache)
-            try {
-              devFeeAddress = await devFeeManager.fetchDevFeeAddress();
-              console.log(`[Orchestrator] [DEV FEE] Got new address: ${devFeeAddress}`);
-            } catch (error: any) {
-              console.error(`[Orchestrator] [DEV FEE] ✗ Failed to fetch new dev fee address: ${error.message}`);
-              console.log(`[Orchestrator] [DEV FEE] Skipping dev fee solution - cannot get new address`);
-              continue;
-            }
-
-            // Validate new address format
-            if (!devFeeAddress || (!devFeeAddress.startsWith('addr1') && !devFeeAddress.startsWith('tnight1'))) {
-              console.error(`[Orchestrator] [DEV FEE] ✗ Invalid new address format: ${devFeeAddress}`);
-              console.log(`[Orchestrator] [DEV FEE] Skipping dev fee solution - invalid new address`);
-              continue;
-            }
-
-            // Check again if the new address has solved this challenge
-            const newSolvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
-            if (newSolvedChallenges && newSolvedChallenges.has(this.currentChallengeId)) {
-              console.error(`[Orchestrator] [DEV FEE] ✗ New address ${devFeeAddress} has also already solved this challenge. Skipping dev fee for now.`);
-              continue;
-            }
-          }
-
-          console.log(`[Orchestrator] [DEV FEE] Mining for address: ${devFeeAddress}`);
-          console.log(`[Orchestrator] [DEV FEE] Using 1 worker in background (user mining continues)...`);
-
-          // Create a temporary DerivedAddress object for the dev fee address
-          const devFeeAddr: DerivedAddress = {
-            index: -1, // Special index for dev fee
-            bech32: devFeeAddress,
-            publicKeyHex: '', // Not needed for dev fee address
-            registered: true, // Assume dev fee addresses are always registered
-          };
-
-          // Use only 1 worker for dev fee (worker 0) so it runs in background without blocking user mining
-          // This allows user mining to continue on other workers while dev fee mines
-          const MAX_DEV_FEE_FAILURES = 6;
-          await this.mineForAddress(devFeeAddr, true, 0, MAX_DEV_FEE_FAILURES);
-
-          console.log(`[Orchestrator] [DEV FEE] ✓ Completed successfully`);
-          if (devFeesNeeded > 1) {
-            console.log(`[Orchestrator] [DEV FEE] Still behind by ${devFeesNeeded - 1}, will check again after next user solution`);
-          }
-
-        } catch (error: any) {
-          console.error(`[Orchestrator] [DEV FEE] ✗ Failed:`, error.message);
-          // Continue even if dev fee fails
-        }
-      }
-
-      console.log('[Orchestrator] ========== DEV FEE CHECK COMPLETE ==========');
-    } else if (devFeesNeeded === 0) {
-      console.log('[Orchestrator] ✓ Dev fees are up to date, no payment needed');
-      console.log('[Orchestrator] ========== DEV FEE CHECK COMPLETE ==========');
-    } else {
-      console.log('[Orchestrator] ⚠ Dev fees ahead of schedule (normal if previous dev fee mining failed)');
-      console.log('[Orchestrator] ========== DEV FEE CHECK COMPLETE ==========');
-    }
-  }
-
-  /**
    * Fetch current challenge from API
    */
   private async fetchChallenge(): Promise<ChallengeResponse> {
     const response = await axios.get(`${this.apiBase}/challenge`);
     return response.data;
+  }
+
+  /**
+   * Start dev fee mining in background (non-blocking)
+   * Uses 20% of workers to mine dev fee while other 80% continue user mining
+   */
+  private startDevFeeMining(): void {
+    // Don't start if already mining dev fee
+    if (this.isDevFeeMining) {
+      console.log('[Orchestrator] Dev fee already mining, skipping...');
+      return;
+    }
+
+    // Don't start if dev fee not enabled
+    if (!devFeeManager.isEnabled() || !devFeeManager.hasValidAddressPool()) {
+      console.log('[Orchestrator] Dev fee not enabled or no valid address pool');
+      return;
+    }
+
+    // Don't start if no active challenge
+    if (!this.currentChallengeId) {
+      console.log('[Orchestrator] No active challenge, skipping dev fee');
+      return;
+    }
+
+    this.isDevFeeMining = true;
+    console.log('[Orchestrator] [DEV FEE] Starting dev fee mining in background...');
+
+    // Run dev fee mining in background (don't await)
+    this.mineDevFeeInBackground()
+      .then(() => {
+        this.isDevFeeMining = false;
+        console.log('[Orchestrator] [DEV FEE] Background mining completed');
+      })
+      .catch((error: any) => {
+        this.isDevFeeMining = false;
+        console.error('[Orchestrator] [DEV FEE] Background mining failed:', error.message);
+      });
+  }
+
+  /**
+   * Mine dev fee in background using 20% of workers
+   */
+  private async mineDevFeeInBackground(): Promise<void> {
+    try {
+      // Fetch dev fee address
+      console.log(`[Orchestrator] [DEV FEE] Fetching dev fee address...`);
+      let devFeeAddress: string;
+
+      try {
+        devFeeAddress = await devFeeManager.getDevFeeAddress();
+      } catch (error: any) {
+        console.error(`[Orchestrator] [DEV FEE] ✗ Failed to get dev fee address: ${error.message}`);
+        return;
+      }
+
+      // Validate address format
+      if (!devFeeAddress || (!devFeeAddress.startsWith('addr1') && !devFeeAddress.startsWith('tnight1'))) {
+        console.error(`[Orchestrator] [DEV FEE] ✗ Invalid address format: ${devFeeAddress}`);
+        return;
+      }
+
+      // Check if this address has already solved the current challenge
+      const solvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
+      if (solvedChallenges && solvedChallenges.has(this.currentChallengeId!)) {
+        console.log(`[Orchestrator] [DEV FEE] Address already solved current challenge, fetching new address...`);
+        try {
+          devFeeAddress = await devFeeManager.fetchDevFeeAddress();
+        } catch (error: any) {
+          console.error(`[Orchestrator] [DEV FEE] ✗ Failed to fetch new address: ${error.message}`);
+          return;
+        }
+
+        // Check again
+        const newSolvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
+        if (newSolvedChallenges && newSolvedChallenges.has(this.currentChallengeId!)) {
+          console.error(`[Orchestrator] [DEV FEE] ✗ New address also solved challenge, skipping`);
+          return;
+        }
+      }
+
+      console.log(`[Orchestrator] [DEV FEE] Mining for address: ${devFeeAddress}`);
+
+      // Calculate 20% of workers (round up to at least 1)
+      const devFeeWorkers = Math.max(1, Math.ceil(this.workerThreads * 0.2));
+      console.log(`[Orchestrator] [DEV FEE] Using ${devFeeWorkers} workers (20% of ${this.workerThreads}) for dev fee mining`);
+
+      // Create a temporary DerivedAddress object for the dev fee address
+      const devFeeAddr: DerivedAddress = {
+        index: -1, // Special index for dev fee
+        bech32: devFeeAddress,
+        publicKeyHex: '', // Not needed for dev fee address
+        registered: true, // Assume dev fee addresses are always registered
+      };
+
+      // Launch multiple workers for dev fee (20% of total)
+      // Use the "top" worker IDs that user mining won't use when dev fee is active
+      // E.g., if we have 11 workers total and 20% = 3 workers for dev fee,
+      // user mining uses 0-7 (8 workers = 80%), dev fee uses 8-10 (3 workers = 20%)
+      const userWorkers = Math.floor(this.workerThreads * 0.8);
+      const workers = Array(devFeeWorkers).fill(null).map((_, i) =>
+        this.mineForAddress(devFeeAddr, true, userWorkers + i, 6)
+      );
+
+      await Promise.all(workers);
+      console.log(`[Orchestrator] [DEV FEE] ✓ Dev fee solution mined successfully`);
+
+    } catch (error: any) {
+      console.error(`[Orchestrator] [DEV FEE] ✗ Failed:`, error.message);
+    }
   }
 
   /**
