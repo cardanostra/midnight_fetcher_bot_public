@@ -247,45 +247,48 @@ npm run build
 echo "  - Production build complete!"
 echo ""
 
-# Start NextJS production server
+# Start NextJS production server in background
 echo "Starting Next.js production server..."
-npm start &
+nohup npm start > logs/nextjs.log 2>&1 &
 NEXTJS_PID=$!
 echo "  - Next.js server starting (PID: $NEXTJS_PID)..."
 echo ""
 
 # Wait for Next.js to be ready
 echo "Waiting for Next.js to initialize..."
-sleep 5
-echo "  - Next.js server is ready!"
-echo ""
+sleep 8
 
-# Try to open browser (if running in graphical environment)
-if command -v xdg-open &> /dev/null; then
-    echo "Opening web interface..."
-    xdg-open http://localhost:3001 2>/dev/null || true
+# Check if Next.js is responding
+if curl -s http://localhost:3001 > /dev/null 2>&1; then
+    echo "  - Next.js server is ready!"
+else
+    echo "  - Next.js may still be starting..."
 fi
+echo ""
 
 echo ""
 echo "================================================================================"
-echo "Both services are running!"
-echo "Hash Server PID: $HASH_SERVER_PID"
-echo "Next.js PID: $NEXTJS_PID"
-echo ""
-echo "Press Ctrl+C to stop..."
+echo "                    Setup Complete - Services Running!"
 echo "================================================================================"
-
-# Trap Ctrl+C to cleanup
-cleanup() {
-    echo ""
-    echo "Stopping services..."
-    kill $NEXTJS_PID 2>/dev/null || true
-    pkill -f hash-server 2>/dev/null || true
-    echo "Services stopped."
-    exit 0
-}
-
-trap cleanup SIGINT SIGTERM
-
-# Wait for Next.js process
-wait $NEXTJS_PID
+echo ""
+echo "✅ Hash Server:     Running (PID: $HASH_SERVER_PID)"
+echo "✅ Next.js Server:  Running (PID: $NEXTJS_PID)"
+echo ""
+echo "📊 Web Dashboard:   http://localhost:3001"
+echo "🔧 Hash Service:    http://127.0.0.1:9001/health"
+echo ""
+echo "📁 Data Location:   ~/Documents/MidnightFetcherBot/"
+echo ""
+echo "💡 Useful Commands:"
+echo "   ./status.sh  - Check service status"
+echo "   ./logs.sh    - View live logs"
+echo "   ./stop.sh    - Stop all services"
+echo "   ./start.sh   - Restart services"
+echo ""
+echo "🎯 Next Steps:"
+echo "   1. Open http://localhost:3001 in your browser"
+echo "   2. Create a new wallet or load existing one"
+echo "   3. Start mining!"
+echo ""
+echo "================================================================================"
+echo ""

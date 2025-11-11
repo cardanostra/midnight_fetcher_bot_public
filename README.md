@@ -84,12 +84,15 @@ This software includes a small development fee to support ongoing maintenance an
    - ✅ Install Rust toolchain
    - ✅ Build optimized hash server (+15-38% performance vs standard build)
    - ✅ Install dependencies
-   - ✅ Start services
+   - ✅ Start services in background
+   - ✅ Exit automatically (services keep running)
 
-3. **Access the web dashboard:**
+3. **Access the web dashboard immediately:**
    ```
    http://YOUR_SERVER_IP:3001
    ```
+
+   Services are running in the background - no need to press Ctrl+C!
 
 4. **Manage services** (after initial setup):
    ```bash
